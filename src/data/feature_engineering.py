@@ -245,7 +245,7 @@ class FeatureCalculator(AnalyzerBase):
             result["BBI"] = (result["MA5"] + result["MA10"] + result["MA20"] + result["MA30"]) / 4
 
         # 填充NaN
-        result = result.fillna(method="bfill").fillna(0)
+        result = result.fillna(0)
 
         return result
 
@@ -486,30 +486,36 @@ class MLTrainingDataGenerator(AnalyzerBase):
                             )
                             data_with_features[rps_key] = rps_values.fillna(50.0)
 
-                # 生成标签
+                # 用最长 horizon 构造 valid_mask（排除末尾无未来收益的行，避免 NaN→0 标签泄露）
+                max_horizon = max(self.training_config.PREDICTION_HORIZONS)
+                future_max = data_with_features["close"].shift(-max_horizon) / data_with_features["close"] - 1
+                valid_mask = future_max.notna()
+
+                # 选择特征列（仅保留 valid 行）
+                feature_cols = self._select_feature_columns(data_with_features)
+                features_data = data_with_features.loc[valid_mask, feature_cols]
+                valid_dates = data_with_features.loc[valid_mask, "date"]
+
+                # 生成标签（仅 valid 行）
                 for horizon in self.training_config.PREDICTION_HORIZONS:
                     future_returns = data_with_features["close"].shift(-horizon) / data_with_features["close"] - 1
+                    future_returns = future_returns[valid_mask]
 
                     # 二分类标签
                     for threshold in self.training_config.RETURN_THRESHOLDS:
                         label_name = f"return_{horizon}d_gt_{int(threshold*100)}pct"
-                        labels = (future_returns > threshold).astype(int)
-                        all_labels[label_name].extend(labels.tolist())
+                        all_labels[label_name].extend((future_returns > threshold).astype(int).tolist())
 
                     # 连续标签
                     continuous_name = f"return_{horizon}d_continuous"
                     all_labels[continuous_name].extend(future_returns.tolist())
 
-                # 选择特征列
-                feature_cols = self._select_feature_columns(data_with_features)
-                features_data = data_with_features[feature_cols]
-
-                # 添加到总数据集
+                # 添加到总数据集（仅 valid 行，与标签对齐）
                 for idx in range(len(features_data)):
                     all_features.append(features_data.iloc[idx].values)
                     all_info.append({
                         "stock_code": stock_code,
-                        "date": data_with_features.iloc[idx]["date"].strftime("%Y-%m-%d"),
+                        "date": valid_dates.iloc[idx].strftime("%Y-%m-%d"),
                     })
 
                 # 保存技术指标到原始CSV文件（供后续选股和分析使用）
@@ -535,6 +541,10 @@ class MLTrainingDataGenerator(AnalyzerBase):
         # 保存特征
         np.save(os.path.join(output_dir, f"features_{timestamp}.npy"), X)
 
+        # 保存日期（供 model_trainer 按时间切分，消除时序泄露）
+        dates_arr = np.array([info["date"] for info in all_info])
+        np.save(os.path.join(output_dir, f"dates_{timestamp}.npy"), dates_arr)
+
         # 保存标签
         for label_name, label_values in all_labels.items():
             if len(label_values) == len(X):
@@ -548,14 +558,13 @@ class MLTrainingDataGenerator(AnalyzerBase):
     def _select_feature_columns(self, df: pd.DataFrame) -> List[str]:
         """选择特征列"""
         feature_patterns = [
-            "close",  # 基础价格
             "MA\\d+",  # 移动平均线
             "DIF", "DEA", "MACD",  # MACD
             "K", "D_", "J",  # KDJ (D_避免与DIF冲突)
             "RSI",  # RSI
             "BOLL_UP", "BOLL_MID", "BOLL_LOW",  # 布林带
             "PDI", "MDI", "ADX",  # DMI
-            "OBV", "ROC", "MAROC",  # 其他
+            "ROC", "MAROC",  # 其他
             "BBI",  # BBI
             "rps\\d+",  # RPS
         ]

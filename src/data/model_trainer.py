@@ -152,10 +152,19 @@ class ModelTrainerBase(AnalyzerBase):
         y = np.load(label_path)
         self.logger.info(f"加载标签数据: {label_file}, 形状: {y.shape}")
 
-        return X, y, target_label
+        # 加载日期（供按时间切分，消除时序泄露；旧数据无 dates 则返回 None）
+        dates = None
+        dates_file = f"dates_{timestamp}.npy"
+        dates_path = os.path.join(self.training_data_dir, dates_file)
+        if os.path.exists(dates_path):
+            dates = np.load(dates_path)
+            self.logger.info(f"加载日期数据: {dates_file}, 形状: {dates.shape}")
+
+        return X, y, target_label, dates
 
     def preprocess_data(
-        self, X: np.ndarray, y: Optional[np.ndarray] = None, use_robust: bool = True
+        self, X: np.ndarray, y: Optional[np.ndarray] = None, use_robust: bool = True,
+        fit_scaler: bool = True,
     ) -> Tuple[np.ndarray, Optional[np.ndarray]]:
         """
         数据预处理
@@ -194,13 +203,18 @@ class ModelTrainerBase(AnalyzerBase):
                     X[np.isposinf(col_data), col] = col_max
                     X[np.isneginf(col_data), col] = col_min
 
-        # 标准化
-        if use_robust:
-            self.scaler = RobustScaler()
+        # 标准化（fit_scaler=True 仅在训练集 fit；False 用已 fit scaler transform 测试集，消除泄露）
+        if fit_scaler:
+            if use_robust:
+                self.scaler = RobustScaler()
+            else:
+                self.scaler = StandardScaler()
+            X_scaled = self.scaler.fit_transform(X)
         else:
-            self.scaler = StandardScaler()
-
-        X_scaled = self.scaler.fit_transform(X)
+            if self.scaler is None:
+                self.logger.error("scaler 未训练，无法 transform 测试集")
+                return X, y
+            X_scaled = self.scaler.transform(X)
 
         self.logger.info("数据预处理完成")
 
@@ -292,9 +306,9 @@ class RandomForestTrainer(ModelTrainerBase):
         # 随机森林参数配置
         self.model_params = {
             "n_estimators": 200,
-            "max_depth": 20,
-            "min_samples_split": 2,
-            "min_samples_leaf": 1,
+            "max_depth": 12,            # 收紧：抑制过拟合
+            "min_samples_split": 100,   # 收紧：抑制过拟合
+            "min_samples_leaf": 50,     # 收紧：抑制过拟合
             "max_features": "sqrt",
             "random_state": 42,
             "n_jobs": -1,
@@ -307,6 +321,7 @@ class RandomForestTrainer(ModelTrainerBase):
         y: np.ndarray,
         model_type: str = "classifier",
         test_size: float = 0.2,
+        dates: Optional[np.ndarray] = None,
     ) -> Dict[str, Any]:
         """
         训练随机森林模型
@@ -320,23 +335,32 @@ class RandomForestTrainer(ModelTrainerBase):
         Returns:
             训练结果字典
         """
-        # 预处理数据
-        X_processed, y_processed = self.preprocess_data(X, y)
-
-        # 分割数据集
-        if model_type == "regressor":
-            X_train, X_test, y_train, y_test = train_test_split(
-                X_processed, y_processed, test_size=test_size, random_state=42
-            )
+        # 时序切分（消除随机切分导致的时序泄露）+ scaler 隔离（仅训练集 fit）
+        if dates is not None and len(dates) == len(X):
+            sort_idx = np.argsort(dates, kind="stable")
+            X_sorted, y_sorted = X[sort_idx], y[sort_idx]
+            split = int(len(X_sorted) * (1 - test_size))
+            X_train_raw, X_test_raw = X_sorted[:split], X_sorted[split:]
+            y_train, y_test = y_sorted[:split], y_sorted[split:]
+            self.logger.info(f"按日期时序切分: 训练 {split} / 测试 {len(X_sorted) - split}")
+            X_train, _ = self.preprocess_data(X_train_raw, fit_scaler=True)
+            X_test, _ = self.preprocess_data(X_test_raw, fit_scaler=False)
         else:
-            try:
-                X_train, X_test, y_train, y_test = train_test_split(
-                    X_processed, y_processed, test_size=test_size, random_state=42, stratify=y_processed
-                )
-            except ValueError:
+            self.logger.warning("未提供 dates 或长度不匹配，回退随机切分（存在时序泄露风险）")
+            X_processed, y_processed = self.preprocess_data(X, y)
+            if model_type == "regressor":
                 X_train, X_test, y_train, y_test = train_test_split(
                     X_processed, y_processed, test_size=test_size, random_state=42
                 )
+            else:
+                try:
+                    X_train, X_test, y_train, y_test = train_test_split(
+                        X_processed, y_processed, test_size=test_size, random_state=42, stratify=y_processed
+                    )
+                except ValueError:
+                    X_train, X_test, y_train, y_test = train_test_split(
+                        X_processed, y_processed, test_size=test_size, random_state=42
+                    )
 
         # 创建模型
         if model_type == "regressor":
@@ -410,8 +434,8 @@ class RandomForestTrainer(ModelTrainerBase):
             self.logger.error("标准化器未训练")
             return None, None
 
-        # 预处理
-        X_processed, _ = self.preprocess_data(X)
+        # 预处理（用已 fit scaler transform，不重新 fit）
+        X_processed, _ = self.preprocess_data(X, fit_scaler=False)
 
         # 预测
         predictions = self.model.predict(X_processed)
@@ -438,7 +462,7 @@ class RandomForestTrainer(ModelTrainerBase):
             训练结果字典
         """
         # 加载数据
-        X, y, actual_label = self.load_training_data(target_label)
+        X, y, actual_label, dates = self.load_training_data(target_label)
 
         if X is None or y is None:
             self.logger.error("数据加载失败")
@@ -450,8 +474,8 @@ class RandomForestTrainer(ModelTrainerBase):
         else:
             model_type = "classifier"
 
-        # 训练模型
-        results = self.train(X, y, model_type=model_type, **kwargs)
+        # 训练模型（传 dates 做时序切分）
+        results = self.train(X, y, model_type=model_type, dates=dates, **kwargs)
 
         # 保存模型
         model_name = f"random_forest_{actual_label}"
