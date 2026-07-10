@@ -1,32 +1,47 @@
-.idea/**/workspace.xml
-.idea/**/tasks.xml
-.idea/**/usage.statistics.xml
-.idea/**/dictionaries
-.idea/**/shelf
-.idea/**/aws.xml
-.idea/**/contentModel.xml
-.idea/**/dataSources/
-.idea/**/dataSources.ids
-.idea/**/dataSources.local.xml
-.idea/**/sqlDataSources.xml
-.idea/**/dynamic.xml
-.idea/**/uiDesigner.xml
-.idea/**/dbnavigator.xml
-.idea/**/gradle.xml
-.idea/**/libraries
-cmake-build-*/
-.idea/**/mongoSettings.xml
-*.iws
-out/
-.idea_modules/
-atlassian-ide-plugin.xml
-.idea/replstate.xml
-.idea/sonarlint/
-com_crashlytics_export_strings.xml
-crashlytics.properties
-crashlytics-build.properties
-fabric.properties
-.idea/httpRequests
-.idea/caches/build_file_checksums.ser
+# ===== Python 缓存 =====
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# ===== 虚拟环境 =====
+.venv/
+venv/
+
+# ===== IDE / 编辑器 =====
 .idea/
-/public/index.html
+.vscode/
+.trae/
+*.swp
+
+# ===== 密钥（真实值不入库；.env.example 入库）=====
+.env
+*.env.local
+
+# ===== 数据 / 产物 / 日志目录（体积大、可重生，不入库）=====
+# 这些目录名在仓库任意层级都被忽略（根级与 out/ 下同名目录）
+market_data/
+downloads/
+models/
+reports/
+rps_results/
+training_data/
+cache/
+logs/
+charts/
+results/
+state_archive/
+crontab_backups/
+test_reports/
+test_e2e_reports/
+*.log
+
+# ===== OS =====
+.DS_Store
+Thumbs.db
+
+# 注意：所有 .py 源码（src/ tests/ back/ deep-search/ out/）默认入库，不做忽略
