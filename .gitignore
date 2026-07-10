@@ -45,3 +45,9 @@ test_e2e_reports/
 Thumbs.db
 
 # 注意：所有 .py 源码（src/ tests/ back/ deep-search/ out/）默认入库，不做忽略
+
+# Claude Code 配置
+.claude/
+
+# 分析图片产物
+back/*.png
