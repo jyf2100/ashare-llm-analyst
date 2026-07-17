@@ -21,6 +21,7 @@ def run_all_tests():
 
     test_files = [
         "test_providers.py",
+        "test_providers_harden.py",
         "test_downloaders.py",
         "test_rps_calculator.py",
         "test_feature_engineering.py",

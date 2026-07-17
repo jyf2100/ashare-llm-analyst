@@ -120,6 +120,9 @@ class TestBaostockProvider:
 
     def setup_method(self):
         """测试前准备"""
+        # 重置模块级共享 login 状态（BaostockProvider 已改为共享 login + 引用计数），
+        # 保证各测试用例相互隔离，不受先前用例 login/logout 残留影响。
+        BaostockProvider._reset_login_state()
         self.provider = BaostockProvider()
 
     def teardown_method(self):
@@ -206,10 +209,14 @@ class TestBaostockProvider:
 
     def test_close(self):
         """测试关闭连接"""
-        provider = BaostockProvider()
-        provider._logged_in = True
+        # 经 _ensure_login 真实登录（共享 login + 引用计数），再 close 触发 logout。
+        with mock.patch('src.data.providers.bs.login') as mock_login, \
+             mock.patch('src.data.providers.bs.logout') as mock_logout:
+            mock_login.return_value.error_code = "0"
+            provider = BaostockProvider()
+            provider._ensure_login()
+            assert provider._logged_in is True
 
-        with mock.patch('src.data.providers.bs.logout') as mock_logout:
             provider.close()
             assert provider._logged_in is False
             mock_logout.assert_called_once()
