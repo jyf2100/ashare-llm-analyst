@@ -146,6 +146,7 @@ class DataFetchError(StockAnalysisError):
         message: str,
         source: Optional[str] = None,
         context: Optional[ContextDict] = None,
+        error_code: Optional[ErrorCode] = None,
     ) -> None:
         """
         初始化数据获取错误
@@ -154,11 +155,14 @@ class DataFetchError(StockAnalysisError):
             message: 错误消息
             source: 数据源名称(可选)
             context: 额外上下文信息
+            error_code: 错误码(可选)。None 则回退到 ``DATA_FETCH_FAILED`` (E1000)；
+                可传本类的细分码常量（如 :attr:`NETWORK_ERROR` / :attr:`API_ERROR`）
+                以便调用方按码区分网络错误与 API/参数错误。
         """
         ctx = context or {}
         if source:
             ctx["source"] = source
-        super().__init__(message, ctx, self.DATA_FETCH_FAILED)
+        super().__init__(message, ctx, error_code or self.DATA_FETCH_FAILED)
 
 
 class ModelLoadError(StockAnalysisError):

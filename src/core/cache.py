@@ -14,11 +14,15 @@ import functools
 import hashlib
 import inspect
 import json
+import os
 import pickle
+import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional, TypeVar, Union
+
+import joblib
 
 from src.core.exceptions import CacheError
 from src.core.logger import get_logger
@@ -177,27 +181,193 @@ class MemoryCache:
         }
 
 
+class FileCache:
+    """
+    文件缓存后端（joblib 持久化，TTL via 文件 mtime）
+
+    兑现 :class:`CacheConfig` 的 ``backend="file"`` 选项（此前为声明却未实现的桩）。
+
+    落盘格式为 **joblib**：运行环境未安装 pyarrow/fastparquet（无法用 parquet），
+    而 joblib 已在 ``requirement.txt`` / ``environment.yml`` 登记，且能完整保留
+    ``DataFrame`` 的 dtype（日期/数值列），避免 CSV 往返造成的类型丢失。
+
+    设计要点：
+        - TTL 通过文件 mtime 判断（跨进程有效）。
+        - 写入采用 ``.tmp`` + ``os.replace`` 原子替换，避免半写文件被读。
+        - 写失败**只降级到内存索引并记 warning**，绝不吞掉取数结果
+          （缓存是优化路径，非数据来源）。
+        - 维护一份内存索引 ``_store`` 仅供 ``stats``/兼容 ``clear_cache`` 使用，
+          真正的命中判定以磁盘为准（跨进程一致）。
+
+    Attributes:
+        ttl: 默认缓存存活时间(秒)
+        cache_dir: 缓存目录
+    """
+
+    # 文件名只保留这些字符，其余替换为下划线（保留可读的 key 组成）
+    _SAFE_NAME = re.compile(r"[^A-Za-z0-9_.=\-]")
+
+    def __init__(self, ttl: int = 3600, cache_dir: str = "cache"):
+        """
+        初始化文件缓存
+
+        Args:
+            ttl: 默认缓存存活时间(秒)
+            cache_dir: 缓存目录
+        """
+        self.ttl = ttl
+        self.cache_dir = Path(cache_dir)
+        # 内存索引：仅用于 stats()/clear_cache() 兼容；命中判定以磁盘为准
+        self._store: Dict[str, Any] = {}
+
+    def _path(self, key: str) -> Path:
+        """根据缓存键生成磁盘路径（文件名保留 key 组成，过长则回退 md5）"""
+        safe = self._SAFE_NAME.sub("_", key)
+        if len(safe) > 200:
+            safe = hashlib.md5(key.encode()).hexdigest()
+        return self.cache_dir / f"{safe}.joblib"
+
+    def get(self, key: str) -> Optional[Any]:
+        """
+        从磁盘读取缓存值
+
+        Args:
+            key: 缓存键
+
+        Returns:
+            缓存值；不存在 / 已过期 / 读取失败则返回 None
+        """
+        path = self._path(key)
+        if not path.exists():
+            return None
+        # TTL via mtime
+        if self.ttl and (time.time() - path.stat().st_mtime) > self.ttl:
+            return None
+        try:
+            return joblib.load(path)
+        except Exception as e:
+            logger.warning(f"文件缓存读取失败，将直取底层: {e}")
+            return None
+
+    def set(self, key: str, value: Any, ttl: Optional[int] = None) -> None:
+        """
+        写入缓存到磁盘（原子替换；写失败降级到内存索引并 warning）
+
+        Args:
+            key: 缓存键
+            value: 要缓存的值
+            ttl: 存活时间(秒)，目前以实例级 ttl / mtime 为准，此处忽略
+        """
+        try:
+            self.cache_dir.mkdir(parents=True, exist_ok=True)
+            path = self._path(key)
+            tmp = path.with_suffix(".joblib.tmp")
+            joblib.dump(value, tmp)
+            os.replace(str(tmp), str(path))
+            self._store[key] = path
+        except Exception as e:
+            # 缓存是优化路径：写失败不抛、不吞数据，仅 warning
+            logger.warning(f"文件缓存写入失败，降级到内存索引: {e}")
+            self._store[key] = value
+
+    def delete(self, key: str) -> bool:
+        """
+        删除缓存条目
+
+        Args:
+            key: 缓存键
+
+        Returns:
+            True if deleted, False if not found
+        """
+        self._store.pop(key, None)
+        path = self._path(key)
+        try:
+            if path.exists():
+                path.unlink()
+                return True
+        except Exception as e:
+            logger.warning(f"删除文件缓存失败: {e}")
+        return False
+
+    def clear(self) -> None:
+        """清空磁盘与内存中的所有缓存条目"""
+        try:
+            if self.cache_dir.exists():
+                for f in self.cache_dir.glob("*.joblib"):
+                    f.unlink()
+        except Exception as e:
+            logger.warning(f"清空文件缓存失败: {e}")
+        self._store.clear()
+
+    def cleanup_expired(self) -> int:
+        """
+        清理过期的磁盘缓存条目
+
+        Returns:
+            清理的条目数量
+        """
+        if not self.ttl or not self.cache_dir.exists():
+            return 0
+        now = time.time()
+        n = 0
+        for f in self.cache_dir.glob("*.joblib"):
+            try:
+                if now - f.stat().st_mtime > self.ttl:
+                    f.unlink()
+                    n += 1
+            except Exception:
+                pass
+        return n
+
+    def stats(self) -> Dict[str, Any]:
+        """
+        获取缓存统计信息
+
+        Returns:
+            包含 entries、total_hits、expired 的字典
+        """
+        entries = 0
+        expired = 0
+        if self.cache_dir.exists():
+            now = time.time()
+            for f in self.cache_dir.glob("*.joblib"):
+                entries += 1
+                if self.ttl and now - f.stat().st_mtime > self.ttl:
+                    expired += 1
+        return {"entries": entries, "total_hits": 0, "expired": expired}
+
+
 # ========== 全局缓存实例管理 ==========
 
-# 全局缓存字典 {cache_key: MemoryCache}
-_caches: Dict[str, MemoryCache] = {}
+# 全局缓存字典 {cache_key: MemoryCache | FileCache}
+_caches: Dict[str, Any] = {}
 
 
-def _get_cache(config: CacheConfig) -> MemoryCache:
+def _get_cache(config: CacheConfig) -> Any:
     """
-    获取或创建缓存实例
+    获取或创建缓存实例（memory 或 file 后端）
+
+    此前恒返回 :class:`MemoryCache`（file 后端是声明却未实现的桩）；
+    现按 ``config.backend`` 选择：``"file"`` 返回 :class:`FileCache`，其余返回
+    :class:`MemoryCache`，真正兑现 :class:`CacheConfig` 的 ``backend`` 字段。
+
+    单例键包含 backend/key_prefix/cache_dir/ttl，避免不同配置串用同一实例。
 
     Args:
         config: 缓存配置
 
     Returns:
-        MemoryCache实例
+        缓存实例（MemoryCache 或 FileCache）
     """
-    # 使用backend和key_prefix组合作为缓存标识
-    cache_key = f"{config.backend}_{config.key_prefix}"
+    # 使用 backend/key_prefix/cache_dir/ttl 组合作为缓存标识
+    cache_key = f"{config.backend}|{config.key_prefix}|{config.cache_dir}|{config.ttl}"
     if cache_key not in _caches:
         # 创建新缓存实例
-        _caches[cache_key] = MemoryCache(ttl=config.ttl)
+        if config.backend == "file":
+            _caches[cache_key] = FileCache(ttl=config.ttl, cache_dir=config.cache_dir)
+        else:
+            _caches[cache_key] = MemoryCache(ttl=config.ttl)
     return _caches[cache_key]
 
 

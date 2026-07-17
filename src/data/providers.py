@@ -1,27 +1,95 @@
 """
 数据提供者模块
 
-提供统一的数据访问接口，支持多种数据源(baostock API、CSV文件等)
+提供统一的数据访问接口，支持多种数据源(baostock API、CSV文件等)。
+
+硬化要点（PRD: baostock 行情模块反扒硬化 + 磁盘缓存 + 错误必 raise）：
+    - ``BaostockProvider`` 内置「反扒限速 + 礼貌重试 + 磁盘缓存 + 错误必 raise +
+      线程安全 login」，使得**任何** baostock 调用方（downloaders 内部 /
+      ``pipeline.py`` 直连 / 其它直连）都统一受保护，消除「绕过 downloaders 即裸奔」。
+    - 反扒/重试的共享实现见 :mod:`src.core.anti_crawler`（自 downloaders 下沉复用）。
+    - 磁盘缓存走 :class:`~src.core.cache.FileCache`（joblib；环境无 pyarrow/fastparquet）。
 """
 
 import os
+import random
+import re
+import threading
+import time
 from abc import ABC, abstractmethod
 from datetime import datetime
-from typing import Any, Dict, Generic, List, Optional, TypeVar
-
-T = TypeVar("T")
+from typing import Generic, List, Optional, TypeVar
 
 import baostock as bs
 import pandas as pd
-from functools import wraps
 
+from src.core.anti_crawler import AntiCrawlerController, RequestRetryManager
 from src.core.base import FileSystemProvider
-from src.core.cache import CacheConfig, cached
+from src.core.cache import CacheConfig, FileCache, MemoryCache
 from src.core.config import Config, get_config
 from src.core.exceptions import DataFetchError
 from src.core.logger import get_logger
 
 logger = get_logger(__name__)
+
+T = TypeVar("T")
+
+
+# ========== baostock 调用的全局保护（模块级共享，所有 BaostockProvider 实例复用） ==========
+
+# 相邻两次 baostock 网络请求的**最小间隔**（秒）。0 = 不限速。
+# 可由环境变量 BAOSTOCK_MIN_INTERVAL 覆盖；测试中可直接改 ``_baostock_rate_limiter.min_interval``。
+BAOSTOCK_MIN_INTERVAL = float(os.environ.get("BAOSTOCK_MIN_INTERVAL", "0.2"))
+# 单次 load 内对网络/未知错误的最大重试次数（不含首次调用）。
+BAOSTOCK_MAX_RETRIES = int(os.environ.get("BAOSTOCK_MAX_RETRIES", "3"))
+
+
+class RateLimiter:
+    """
+    最小间隔限速器（pacer）
+
+    保证任意两次 :meth:`acquire` 「放行」之间相距至少 ``min_interval`` 秒。
+
+    与 :class:`~src.core.anti_crawler.AntiCrawlerController` 的自适应延时不同，这里给出的是
+    **硬下界**（无向下随机抖动），便于可测试地断言「相邻请求间隔 ≥ X」。
+    线程安全。``min_interval <= 0`` 时退化为不限速（:meth:`acquire` 立即返回）。
+    """
+
+    def __init__(self, min_interval: float = 0.2):
+        self.min_interval = min_interval
+        self._lock = threading.Lock()
+        self._last_release = 0.0  # monotonic 时间戳
+
+    def acquire(self) -> None:
+        """阻塞至距上次放行已满 min_interval（min_interval<=0 时立即返回）。"""
+        if self.min_interval <= 0:
+            return
+        with self._lock:
+            now = time.monotonic()
+            wait = self.min_interval - (now - self._last_release)
+            if wait > 0:
+                time.sleep(wait)
+                self._last_release = time.monotonic()
+            else:
+                self._last_release = now
+
+
+# 模块级单例限速闸：所有 BaostockProvider 实例共享，避免各自独立计时导致全局超频。
+_baostock_rate_limiter = RateLimiter(BAOSTOCK_MIN_INTERVAL)
+
+# baostock 全局 login 会话的共享状态（bs.login 是进程级单例会话）。
+# 用锁 + 引用计数实现「多实例共享一次 login、互不踩 close」。
+_login_lock = threading.Lock()
+_global_logged_in = False
+_login_refcount = 0
+
+
+def _reset_login_state() -> None:
+    """重置模块级共享 login 状态（仅供测试隔离使用）。"""
+    global _global_logged_in, _login_refcount
+    with _login_lock:
+        _global_logged_in = False
+        _login_refcount = 0
 
 
 class DataProvider(ABC, Generic[T]):
@@ -111,10 +179,17 @@ class BaostockProvider(DataProvider[pd.DataFrame]):
     """
     baostock API数据提供者
 
-    封装baostock API调用，提供股票历史数据查询功能
+    封装baostock API调用，提供股票历史数据查询功能。
 
-    Attributes:
-        _logged_in: 是否已登录baostock
+    内置保护（对所有调用方统一生效）：
+        - **反扒限速**：模块级共享 :data:`_baostock_rate_limiter`，相邻请求间隔 ≥
+          :data:`BAOSTOCK_MIN_INTERVAL`。
+        - **礼貌重试**：网络/未知错误按指数退避（0.5/1/2s + 抖动）重试 ≤
+          :data:`BAOSTOCK_MAX_RETRIES` 次；参数错误不重试。
+        - **磁盘缓存**：默认 joblib 落盘（``cache/``），同参重复 load 不重复打 baostock。
+        - **错误必 raise**：network/unknown/parameter 错误抛 :class:`DataFetchError`；
+          data 类（无数据/停牌）返回 ``None``（合法空）。
+        - **线程安全 login**：模块级锁 + 引用计数，多实例共享一次 login、互不踩 close。
 
     Example:
         >>> provider = BaostockProvider()
@@ -125,40 +200,70 @@ class BaostockProvider(DataProvider[pd.DataFrame]):
     # API字段映射
     API_FIELDS = "date,code,open,high,low,close,preclose,volume,amount,adjustflag,turn,tradestatus,pctChg,isST"
 
-    def __init__(self, config: Optional[Config] = None):
+    def __init__(
+        self,
+        config: Optional[Config] = None,
+        cache_config: Optional[CacheConfig] = None,
+    ):
         """
         初始化baostock数据提供者
 
         Args:
             config: 配置实例
+            cache_config: 缓存配置，None 则默认启用 joblib 磁盘缓存（``cache/``）；
+                传 ``CacheConfig(enabled=False)`` 可关闭缓存。
         """
         super().__init__(config)
         self._logged_in = False
+        # 指向模块级共享限速闸单例（便于测试断言多实例共享同一闸）
+        self._rate_limiter = _baostock_rate_limiter
+        self._retry_manager = RequestRetryManager(max_retries=BAOSTOCK_MAX_RETRIES)
+        cc = cache_config if cache_config is not None else CacheConfig(backend="file", cache_dir="cache")
+        self._cache = self._build_cache(cc)
+
+    @staticmethod
+    def _build_cache(cc: CacheConfig):
+        """根据 CacheConfig 构造缓存实例（None 表示不缓存）。"""
+        if not cc.enabled:
+            return None
+        if cc.backend == "file":
+            return FileCache(ttl=cc.ttl, cache_dir=cc.cache_dir)
+        return MemoryCache(ttl=cc.ttl)
+
+    @staticmethod
+    def _reset_login_state() -> None:
+        """重置模块级共享 login 状态（仅供测试隔离使用）。"""
+        _reset_login_state()
 
     def _ensure_login(self) -> None:
-        """确保已登录baostock系统"""
-        if self._logged_in:
-            return
-
-        lg = bs.login()
-        if lg.error_code != "0":
-            raise DataFetchError(
-                f"baostock登录失败: {lg.error_msg}",
-                source="baostock",
-                context={"error_code": lg.error_code},
-            )
-        self._logged_in = True
-        logger.info("baostock登录成功")
+        """确保已登录baostock系统（线程安全共享：多实例只 login 一次）。"""
+        global _global_logged_in, _login_refcount
+        with _login_lock:
+            if self._logged_in:
+                return
+            if not _global_logged_in:
+                lg = bs.login()
+                if lg.error_code != "0":
+                    raise DataFetchError(
+                        f"baostock登录失败: {getattr(lg, 'error_msg', '')}",
+                        source="baostock",
+                        error_code=DataFetchError.NETWORK_ERROR,
+                        context={"error_code": lg.error_code},
+                    )
+                _global_logged_in = True
+                logger.info("baostock登录成功")
+            self._logged_in = True
+            _login_refcount += 1
 
     def _format_stock_code(self, stock_code: str) -> str:
         """
         格式化股票代码为baostock格式
 
         Args:
-            stock_code: 股票代码(如 "600000", "sh.600000", "sz.000001")
+            stock_code: 股票代码(如 "600000", "sh.600000", "sz.000001", "bj.830000")
 
         Returns:
-            baostock格式的股票代码 (sh.xxxxxx 或 sz.xxxxxx)
+            baostock格式的股票代码 (sh./sz./bj. 前缀)
         """
         # 已经是baostock格式
         if "." in stock_code:
@@ -170,6 +275,9 @@ class BaostockProvider(DataProvider[pd.DataFrame]):
                 return f"sh.{stock_code}"
             elif stock_code.startswith(("0", "3")):
                 return f"sz.{stock_code}"
+            elif stock_code.startswith("8"):
+                # 北交所
+                return f"bj.{stock_code}"
 
         # 无法转换，返回原值
         return stock_code
@@ -181,6 +289,7 @@ class BaostockProvider(DataProvider[pd.DataFrame]):
         end_date: Optional[str] = None,
         frequency: str = "d",
         adjustflag: str = "3",
+        filter_st: bool = True,
         **kwargs,
     ) -> Optional[pd.DataFrame]:
         """
@@ -192,19 +301,15 @@ class BaostockProvider(DataProvider[pd.DataFrame]):
             end_date: 结束日期 (YYYY-MM-DD)
             frequency: 数据频率 (d=日线, w=周线, m=月线)
             adjustflag: 复权类型 (1=后复权, 2=前复权, 3=不复权)
+            filter_st: 是否过滤停牌/ST 行（默认 True，与历史行为一致）；False 则保留全部行。
             **kwargs: 其他参数
 
         Returns:
-            股票数据DataFrame，失败返回None
+            股票数据DataFrame；data 类（无数据/停牌）返回 None。
 
         Raises:
-            DataFetchError: 数据获取失败时抛出
+            DataFetchError: 网络/未知/参数错误时抛出（绝不静默返回 None）。
         """
-        self._ensure_login()
-
-        # 格式化股票代码
-        stock_code = self._format_stock_code(identifier)
-
         # 默认日期范围
         if end_date is None:
             end_date = datetime.now().strftime("%Y-%m-%d")
@@ -212,32 +317,33 @@ class BaostockProvider(DataProvider[pd.DataFrame]):
             # 默认获取最近一年数据
             start_date = (datetime.now().replace(year=datetime.now().year - 1)).strftime("%Y-%m-%d")
 
+        stock_code = self._format_stock_code(identifier)
+
+        # 1) 缓存命中则直接返回（命中时无需 login，省一次 baostock 调用）
+        cache_key = (
+            f"bs_k:{stock_code}:start={start_date}:end={end_date}"
+            f":freq={frequency}:adj={adjustflag}"
+        )
+        if self._cache is not None:
+            cached = self._cache.get(cache_key)
+            if cached is not None:
+                logger.debug(f"BaostockProvider缓存命中: {cache_key}")
+                return cached.copy()
+
         logger.debug(f"查询baostock: {stock_code}, {start_date} ~ {end_date}")
 
-        # 调用API
-        rs = bs.query_history_k_data_plus(
-            stock_code,
-            self.API_FIELDS,
-            start_date=start_date,
-            end_date=end_date,
-            frequency=frequency,
-            adjustflag=adjustflag,
-        )
+        # 2) login（线程安全共享）
+        self._ensure_login()
 
-        if rs.error_code != "0":
-            error_type = self._classify_error(rs.error_msg)
-            if error_type == "parameter":
-                raise DataFetchError(
-                    f"baostock查询失败: {rs.error_msg}",
-                    source="baostock",
-                    context={"stock_code": stock_code, "error_code": rs.error_code},
-                )
-            logger.warning(f"baostock查询返回错误: {rs.error_msg}")
+        # 3) 查询：限速 + 礼貌重试 + 错误必 raise
+        rs = self._query_with_retry(stock_code, start_date, end_date, frequency, adjustflag)
+        if rs is None:
+            # data 类（无数据/停牌）：合法空，不缓存 None
             return None
 
-        # 收集数据
+        # 4) 收集数据
         data_list = []
-        while (rs.error_code == "0") & rs.next():
+        while (rs.error_code == "0") and rs.next():
             data_list.append(rs.get_row_data())
 
         if not data_list:
@@ -255,16 +361,100 @@ class BaostockProvider(DataProvider[pd.DataFrame]):
 
         df["date"] = pd.to_datetime(df["date"])
 
-        # 过滤停牌和ST股票
-        df = df[(df["tradestatus"] == "1") & (df["isST"] == "0")]
+        # 5) 过滤停牌和ST股票（可选；默认行为与改动前一致）
+        if filter_st:
+            df = df[(df["tradestatus"] == "1") & (df["isST"] == "0")]
 
         # 数据验证
         if len(df) == 0:
             logger.warning(f"股票 {stock_code} 过滤后无有效数据")
             return None
 
+        # 6) 写缓存
+        if self._cache is not None:
+            self._cache.set(cache_key, df)
+
         logger.debug(f"成功获取 {len(df)} 条数据")
         return df
+
+    def _query_with_retry(
+        self,
+        stock_code: str,
+        start_date: str,
+        end_date: str,
+        frequency: str,
+        adjustflag: str,
+    ):
+        """
+        带限速/重试/错误分类的 baostock 查询
+
+        - 抛异常：network/unknown 重试至耗尽后 raise DataFetchError(NETWORK_ERROR)；
+          parameter 立即 raise DataFetchError(API_ERROR)。
+        - rs.error_code != "0"：data 类返回 None；network/unknown/parameter raise。
+        - rs.error_code == "0"：返回 rs 供调用方收集行。
+        """
+        attempt = 0
+        while True:
+            self._rate_limiter.acquire()
+            try:
+                rs = bs.query_history_k_data_plus(
+                    stock_code,
+                    self.API_FIELDS,
+                    start_date=start_date,
+                    end_date=end_date,
+                    frequency=frequency,
+                    adjustflag=adjustflag,
+                )
+            except Exception as e:
+                etype = self._classify_error(str(e))
+                if etype == "parameter":
+                    # 参数错误重试无意义，立即抛出
+                    raise DataFetchError(
+                        f"baostock查询参数错误: {e}",
+                        source="baostock",
+                        error_code=DataFetchError.API_ERROR,
+                        context={"stock_code": stock_code},
+                    )
+                if self._retry_manager.should_retry(etype, attempt):
+                    wait = 0.5 * (2 ** attempt) + random.uniform(0, 0.1)
+                    logger.warning(
+                        f"baostock查询异常({etype})，第{attempt + 1}次重试，等待{wait:.2f}s: {e}"
+                    )
+                    time.sleep(wait)
+                    attempt += 1
+                    continue
+                # 重试耗尽（或不可重试）→ 必 raise，绝不静默 None
+                raise DataFetchError(
+                    f"baostock查询失败(网络异常，重试耗尽): {e}",
+                    source="baostock",
+                    error_code=DataFetchError.NETWORK_ERROR,
+                    context={
+                        "stock_code": stock_code,
+                        "attempts": attempt + 1,
+                        "error_type": etype,
+                    },
+                )
+
+            # baostock 返回了 rs（未抛异常）
+            if rs.error_code != "0":
+                etype = self._classify_error(rs.error_msg or "")
+                if etype == "data":
+                    # 无数据/停牌：合法空，返回 None（不缓存、不 raise）
+                    logger.info(f"baostock无数据/停牌({rs.error_msg})，返回None: {stock_code}")
+                    return None
+                code = DataFetchError.NETWORK_ERROR if etype == "network" else DataFetchError.API_ERROR
+                raise DataFetchError(
+                    f"baostock查询失败: {rs.error_msg}",
+                    source="baostock",
+                    error_code=code,
+                    context={
+                        "stock_code": stock_code,
+                        "error_code": rs.error_code,
+                        "error_type": etype,
+                    },
+                )
+
+            return rs
 
     def save(self, identifier: str, data: pd.DataFrame, **kwargs) -> bool:
         """
@@ -285,7 +475,7 @@ class BaostockProvider(DataProvider[pd.DataFrame]):
 
     def exists(self, identifier: str, **kwargs) -> bool:
         """
-        检查股票代码是否有效
+        检查股票代码是否有效（含沪深+北交所）
 
         Args:
             identifier: 股票代码
@@ -294,11 +484,9 @@ class BaostockProvider(DataProvider[pd.DataFrame]):
         Returns:
             股票代码是否有效
         """
-        # 简单验证格式
         code = self._format_stock_code(identifier)
-        pattern = r"^(sh\.6\d{5}|sz\.[03]\d{5})$"
-        import re
-
+        # 沪市 sh.6xxxxx / 深市 sz.[03]xxxxx / 北交所 bj.8xxxxx
+        pattern = r"^(sh\.6\d{5}|sz\.[03]\d{5}|bj\.8\d{5})$"
         return bool(re.match(pattern, code))
 
     def get_all_stocks(self) -> List[str]:
@@ -306,12 +494,13 @@ class BaostockProvider(DataProvider[pd.DataFrame]):
         获取全量A股股票列表
 
         Returns:
-            股票代码列表 (sh.xxxxxx 或 sz.xxxxxx 格式)
+            股票代码列表 (sh./sz./bj. 前缀格式)
 
         Raises:
             DataFetchError: 获取股票列表失败时抛出
         """
         self._ensure_login()
+        self._rate_limiter.acquire()
 
         try:
             # 获取所有证券信息
@@ -343,6 +532,8 @@ class BaostockProvider(DataProvider[pd.DataFrame]):
             logger.info(f"获取到 {len(stock_codes)} 只A股股票")
             return stock_codes
 
+        except DataFetchError:
+            raise
         except Exception as e:
             raise DataFetchError(
                 f"获取股票列表异常: {e}",
@@ -362,11 +553,17 @@ class BaostockProvider(DataProvider[pd.DataFrame]):
         return self.get_all_stocks()
 
     def close(self) -> None:
-        """关闭baostock连接"""
-        if self._logged_in:
-            bs.logout()
+        """关闭baostock连接（引用计数：最后一个实例才真正 logout，互不踩）。"""
+        global _global_logged_in, _login_refcount
+        with _login_lock:
+            if not self._logged_in:
+                return
             self._logged_in = False
-            logger.info("baostock连接已关闭")
+            _login_refcount = max(0, _login_refcount - 1)
+            if _login_refcount == 0 and _global_logged_in:
+                bs.logout()
+                _global_logged_in = False
+                logger.info("baostock连接已关闭")
 
     def __enter__(self):
         """上下文管理器入口"""
@@ -381,7 +578,7 @@ class BaostockProvider(DataProvider[pd.DataFrame]):
     @staticmethod
     def _classify_error(error_msg: str) -> str:
         """
-        分类错误类型
+        分类错误类型（复用 :meth:`AntiCrawlerController.classify_error`）
 
         Args:
             error_msg: 错误消息
@@ -389,36 +586,7 @@ class BaostockProvider(DataProvider[pd.DataFrame]):
         Returns:
             错误类型: 'parameter', 'network', 'data', 'unknown'
         """
-        if not error_msg:
-            return "unknown"
-
-        error_msg_lower = error_msg.lower()
-
-        # 参数错误
-        param_keywords = [
-            "起始日期大于终止日期",
-            "股票代码不存在",
-            "股票代码错误",
-            "日期格式错误",
-            "参数错误",
-            "invalid parameter",
-            "invalid date",
-            "invalid code",
-        ]
-        if any(kw in error_msg_lower for kw in param_keywords):
-            return "parameter"
-
-        # 网络错误
-        network_keywords = ["网络超时", "连接被拒绝", "连接超时", "network timeout", "connection"]
-        if any(kw in error_msg_lower for kw in network_keywords):
-            return "network"
-
-        # 数据问题
-        data_keywords = ["没有数据", "数据为空", "no data", "empty data", "停牌", "suspended"]
-        if any(kw in error_msg_lower for kw in data_keywords):
-            return "data"
-
-        return "unknown"
+        return AntiCrawlerController.classify_error("", error_msg)
 
 
 class CSVProvider(FileSystemProvider[pd.DataFrame]):
@@ -512,8 +680,6 @@ class CSVProvider(FileSystemProvider[pd.DataFrame]):
         """
         try:
             # 确保目录存在
-            import os
-
             os.makedirs(os.path.dirname(path), exist_ok=True)
 
             # 保存为CSV
@@ -557,7 +723,8 @@ class CachedProvider(DataProvider[pd.DataFrame]):
     """
     带缓存的数据提供者装饰器
 
-    为其他数据提供者添加缓存功能，减少重复请求
+    为其他数据提供者添加缓存功能，减少重复请求。支持内存与磁盘（joblib）两种后端：
+    ``CacheConfig(backend="file")`` 时落盘并按 TTL（文件 mtime）过期；默认内存后端。
 
     Attributes:
         provider: 被装饰的数据提供者
@@ -565,7 +732,7 @@ class CachedProvider(DataProvider[pd.DataFrame]):
 
     Example:
         >>> base_provider = BaostockProvider()
-        >>> provider = CachedProvider(base_provider)
+        >>> provider = CachedProvider(base_provider, CacheConfig(backend="file", cache_dir="cache"))
         >>> # 第一次调用会从baostock获取
         >>> df1 = provider.load("sh.600000")
         >>> # 第二次调用会从缓存获取
@@ -582,41 +749,40 @@ class CachedProvider(DataProvider[pd.DataFrame]):
 
         Args:
             provider: 被装饰的数据提供者
-            cache_config: 缓存配置，None则使用默认配置
+            cache_config: 缓存配置，None 则使用默认（内存）配置
         """
         self.provider = provider
         self.cache_config = cache_config or CacheConfig()
-        self.config = provider.config
+        # 兼容底层 provider 无 config 属性的情况（如测试用的 mock 对象）
+        self.config = getattr(provider, "config", None)
+        self._cache = BaostockProvider._build_cache(self.cache_config)
 
     def load(self, identifier: str, **kwargs) -> Optional[pd.DataFrame]:
         """
         加载数据(带缓存)
 
-        首次调用从底层提供者获取并缓存，后续调用从缓存返回
+        首次调用从底层提供者获取并缓存，后续调用从缓存返回。
 
         Args:
             identifier: 股票代码或标识符
             **kwargs: 额外参数
 
         Returns:
-            数据DataFrame，失败返回None
+            数据DataFrame，底层返回None则不缓存、直接返回None
         """
-        # 生成缓存键
-        cache_key = self._make_cache_key(identifier, **kwargs)
-
-        # 检查缓存
-        if self.cache_config.enabled:
-            cached = self._get_from_cache(cache_key)
+        if self._cache is not None:
+            cache_key = self._make_cache_key(identifier, **kwargs)
+            cached = self._cache.get(cache_key)
             if cached is not None:
-                logger.debug(f"缓存命中: {cache_key}")
-                return cached
+                logger.debug(f"CachedProvider缓存命中: {cache_key}")
+                return cached.copy() if hasattr(cached, "copy") else cached
 
         # 从底层提供者获取
         data = self.provider.load(identifier, **kwargs)
 
-        # 存入缓存
-        if data is not None and self.cache_config.enabled:
-            self._save_to_cache(cache_key, data)
+        # 存入缓存（None 不缓存）
+        if data is not None and self._cache is not None:
+            self._cache.set(self._make_cache_key(identifier, **kwargs), data)
 
         return data
 
@@ -633,27 +799,13 @@ class CachedProvider(DataProvider[pd.DataFrame]):
         return self.provider.list_available(**kwargs)
 
     def _make_cache_key(self, identifier: str, **kwargs) -> str:
-        """生成缓存键"""
+        """生成缓存键（含 identifier + 关键查询参数）。"""
         parts = [identifier]
         # 添加关键参数到键
         for key in ["start_date", "end_date", "frequency", "adjustflag"]:
             if key in kwargs:
                 parts.append(f"{key}={kwargs[key]}")
         return ":".join(parts)
-
-    def _get_from_cache(self, key: str) -> Optional[pd.DataFrame]:
-        """从缓存获取数据"""
-        # 这里可以集成到 src.core.cache
-        # 目前简化为内存缓存
-        if not hasattr(self, "_cache"):
-            self._cache = {}
-        return self._cache.get(key)
-
-    def _save_to_cache(self, key: str, data: pd.DataFrame) -> None:
-        """保存数据到缓存"""
-        if not hasattr(self, "_cache"):
-            self._cache = {}
-        self._cache[key] = data
 
 
 def create_provider(provider_type: str, **kwargs) -> DataProvider:
@@ -671,7 +823,7 @@ def create_provider(provider_type: str, **kwargs) -> DataProvider:
         ValueError: 不支持的提供者类型
 
     Example:
-        >>> # 创建baostock提供者
+        >>> # 创建baostock提供者（默认自带磁盘缓存）
         >>> provider = create_provider("baostock")
         >>>
         >>> # 创建CSV提供者
