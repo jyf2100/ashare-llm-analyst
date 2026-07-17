@@ -1,0 +1,410 @@
+# Instincts generated from https://github.com/jyf2100/ashare-llm-analyst
+# Generated: 2026-07-17T10:15:45.084Z
+# Version: 2.0
+# NOTE: This file supplements (does not replace) any existing curated instincts.
+# High-confidence manually curated instincts should be preserved alongside these.
+
+---
+id: ashare-llm-analyst-commit-conventional
+trigger: "when writing a commit message"
+confidence: 0.85
+domain: git
+source: repo-analysis
+source_repo: https://github.com/jyf2100/ashare-llm-analyst
+---
+
+# Ashare Llm Analyst Commit Conventional
+
+## Action
+
+Use conventional commit format with prefixes: feat, refactor, test
+
+## Evidence
+
+- 4 commits analyzed
+- Detected conventional commit pattern
+- Examples: refactor(core): 下沉 AntiCrawlerController/RequestRetryManager 到 anti_crawler.py 供 providers 复用, feat(providers): BaostockProvider 反扒限速 + 礼貌重试 + 磁盘缓存 + 共享登录
+
+---
+id: ashare-llm-analyst-commit-length
+trigger: "when writing a commit message"
+confidence: 0.6
+domain: git
+source: repo-analysis
+source_repo: https://github.com/jyf2100/ashare-llm-analyst
+---
+
+# Ashare Llm Analyst Commit Length
+
+## Action
+
+Write moderate-length commit messages (~61 characters)
+
+## Evidence
+
+- Average commit message length: 61 chars
+- Based on 4 commits
+
+---
+id: ashare-llm-analyst-naming-files
+trigger: "when creating a new file"
+confidence: 0.8
+domain: code-style
+source: repo-analysis
+source_repo: https://github.com/jyf2100/ashare-llm-analyst
+---
+
+# Ashare Llm Analyst Naming Files
+
+## Action
+
+Use snake_case naming convention
+
+## Evidence
+
+- Analyzed file naming patterns in repository
+- Dominant pattern: snake_case
+
+---
+id: ashare-llm-analyst-import-relative
+trigger: "when importing modules"
+confidence: 0.75
+domain: code-style
+source: repo-analysis
+source_repo: https://github.com/jyf2100/ashare-llm-analyst
+---
+
+# Ashare Llm Analyst Import Relative
+
+## Action
+
+Use relative imports for project files
+
+## Evidence
+
+- Import analysis shows relative import pattern
+- Example: import { x } from '../lib/x'
+
+---
+id: ashare-llm-analyst-export-style
+trigger: "when exporting from a module"
+confidence: 0.7
+domain: code-style
+source: repo-analysis
+source_repo: https://github.com/jyf2100/ashare-llm-analyst
+---
+
+# Ashare Llm Analyst Export Style
+
+## Action
+
+Prefer named exports
+
+## Evidence
+
+- Export pattern analysis
+- Dominant style: named
+
+---
+id: ashare-llm-analyst-test-separate
+trigger: "when writing tests"
+confidence: 0.8
+domain: testing
+source: repo-analysis
+source_repo: https://github.com/jyf2100/ashare-llm-analyst
+---
+
+# Ashare Llm Analyst Test Separate
+
+## Action
+
+Place tests in the tests/ or __tests__/ directory, mirroring src structure
+
+## Evidence
+
+- Separate test directory pattern detected
+- Tests live in dedicated test folders
+
+---
+id: ashare-llm-analyst-test-naming
+trigger: "when creating a test file"
+confidence: 0.85
+domain: testing
+source: repo-analysis
+source_repo: https://github.com/jyf2100/ashare-llm-analyst
+---
+
+# Ashare Llm Analyst Test Naming
+
+## Action
+
+Name test files using the pattern: *.test.ts
+
+## Evidence
+
+- File pattern: *.test.ts
+- Consistent across test files
+
+---
+id: ashare-llm-analyst-workflow-feature-development-with-hardened-provider-and-shared-logic
+trigger: "when doing feature development with hardened provider and shared logic"
+confidence: 0.55
+domain: workflow
+source: repo-analysis
+source_repo: https://github.com/jyf2100/ashare-llm-analyst
+---
+
+# Ashare Llm Analyst Workflow Feature Development With Hardened Provider And Shared Logic
+
+## Action
+
+Follow the feature-development-with-hardened-provider-and-shared-logic workflow:
+1. Refactor core logic (e.g., anti-crawler, retry manager) into a reusable module (e.g., src/core/anti_crawler.py)
+2. Update provider implementation to use shared logic and add new features (e.g., rate limiting, retry, caching, shared login) in src/data/providers.py
+3. Update or extend core utilities as needed (e.g., src/core/cache.py, src/core/exceptions.py)
+4. Write or update comprehensive tests for the provider, including offline and edge case coverage (e.g., tests/test_providers_harden.py, tests/test_providers.py)
+5. Register new or updated tests in the test runner (e.g., tests/run_tests.py)
+
+## Evidence
+
+- Workflow detected from commit patterns
+- Frequency: ~1x per month
+- Files: src/core/anti_crawler.py, src/data/downloaders.py, src/data/providers.py
+
+---
+id: ashare-llm-analyst-instinct-naming-files
+trigger: "When creating or renaming a file in the codebase"
+confidence: 0.8
+domain: code-style
+source: repo-analysis
+source_repo: jyf2100/ashare-llm-analyst
+---
+
+# Ashare Llm Analyst Instinct Naming Files
+
+## Action
+
+Use snake_case for file names
+
+## Evidence
+
+- src/core/anti_crawler.py
+- src/core/cache.py
+- src/data/providers.py
+
+---
+id: ashare-llm-analyst-instinct-naming-functions
+trigger: "When defining a new function"
+confidence: 0.7
+domain: code-style
+source: repo-analysis
+source_repo: jyf2100/ashare-llm-analyst
+---
+
+# Ashare Llm Analyst Instinct Naming Functions
+
+## Action
+
+Use camelCase for function names
+
+## Evidence
+
+- Pattern in codeStyle.namingConventions.functions
+
+---
+id: ashare-llm-analyst-instinct-naming-classes
+trigger: "When defining a new class"
+confidence: 0.8
+domain: code-style
+source: repo-analysis
+source_repo: jyf2100/ashare-llm-analyst
+---
+
+# Ashare Llm Analyst Instinct Naming Classes
+
+## Action
+
+Use PascalCase for class names
+
+## Evidence
+
+- Pattern in codeStyle.namingConventions.classes
+
+---
+id: ashare-llm-analyst-instinct-naming-constants
+trigger: "When defining a constant"
+confidence: 0.8
+domain: code-style
+source: repo-analysis
+source_repo: jyf2100/ashare-llm-analyst
+---
+
+# Ashare Llm Analyst Instinct Naming Constants
+
+## Action
+
+Use SCREAMING_SNAKE_CASE for constant names
+
+## Evidence
+
+- Pattern in codeStyle.namingConventions.constants
+
+---
+id: ashare-llm-analyst-instinct-import-style
+trigger: "When importing modules within the package"
+confidence: 0.8
+domain: code-style
+source: repo-analysis
+source_repo: jyf2100/ashare-llm-analyst
+---
+
+# Ashare Llm Analyst Instinct Import Style
+
+## Action
+
+Use relative imports
+
+## Evidence
+
+- Pattern in codeStyle.importStyle
+
+---
+id: ashare-llm-analyst-instinct-export-style
+trigger: "When exporting functions or classes from a module"
+confidence: 0.7
+domain: code-style
+source: repo-analysis
+source_repo: jyf2100/ashare-llm-analyst
+---
+
+# Ashare Llm Analyst Instinct Export Style
+
+## Action
+
+Use named exports
+
+## Evidence
+
+- Pattern in codeStyle.exportStyle
+
+---
+id: ashare-llm-analyst-instinct-test-location
+trigger: "When adding or updating tests"
+confidence: 0.9
+domain: testing
+source: repo-analysis
+source_repo: jyf2100/ashare-llm-analyst
+---
+
+# Ashare Llm Analyst Instinct Test Location
+
+## Action
+
+Place test files in the separate 'tests' folder
+
+## Evidence
+
+- tests/test_providers.py
+- tests/test_providers_harden.py
+- tests/run_tests.py
+
+---
+id: ashare-llm-analyst-instinct-test-type-unit
+trigger: "When writing tests for a module"
+confidence: 0.8
+domain: testing
+source: repo-analysis
+source_repo: jyf2100/ashare-llm-analyst
+---
+
+# Ashare Llm Analyst Instinct Test Type Unit
+
+## Action
+
+Write unit tests
+
+## Evidence
+
+- Pattern in testing.testTypes
+- tests/test_providers.py
+
+---
+id: ashare-llm-analyst-instinct-test-offline
+trigger: "When testing provider logic"
+confidence: 0.8
+domain: testing
+source: repo-analysis
+source_repo: jyf2100/ashare-llm-analyst
+---
+
+# Ashare Llm Analyst Instinct Test Offline
+
+## Action
+
+Ensure tests can run offline and cover edge cases
+
+## Evidence
+
+- test: 新增 BaostockProvider 硬化测试 (26 项验收，全离线)
+- tests/test_providers_harden.py
+
+---
+id: ashare-llm-analyst-instinct-git-commit-format
+trigger: "When writing a commit message"
+confidence: 0.9
+domain: git
+source: repo-analysis
+source_repo: jyf2100/ashare-llm-analyst
+---
+
+# Ashare Llm Analyst Instinct Git Commit Format
+
+## Action
+
+Use Conventional Commits format with prefixes: feat, refactor, test
+
+## Evidence
+
+- refactor(core): 下沉 AntiCrawlerController/RequestRetryManager 到 anti_crawler.py 供 providers 复用
+- feat(providers): BaostockProvider 反扒限速 + 礼貌重试 + 磁盘缓存 + 共享登录
+- test: 新增 BaostockProvider 硬化测试 (26 项验收，全离线)
+
+---
+id: ashare-llm-analyst-instinct-git-commit-length
+trigger: "When composing a commit message"
+confidence: 0.7
+domain: git
+source: repo-analysis
+source_repo: jyf2100/ashare-llm-analyst
+---
+
+# Ashare Llm Analyst Instinct Git Commit Length
+
+## Action
+
+Keep commit messages concise, around 60 characters on average
+
+## Evidence
+
+- Pattern in commits.averageLength
+
+---
+id: ashare-llm-analyst-instinct-workflow-harden-provider
+trigger: "When adding or hardening a data provider with shared anti-crawler/retry logic and requiring robust, offline-testable behavior"
+confidence: 0.9
+domain: workflow
+source: repo-analysis
+source_repo: jyf2100/ashare-llm-analyst
+---
+
+# Ashare Llm Analyst Instinct Workflow Harden Provider
+
+## Action
+
+Follow the workflow: refactor core logic into reusable module, update provider to use shared logic and add features, update core utilities, write/update comprehensive tests (offline/edge cases), register tests in test runner
+
+## Evidence
+
+- Workflow: feature-development-with-hardened-provider-and-shared-logic
+- Commits and files: src/core/anti_crawler.py, src/data/providers.py, tests/test_providers_harden.py
+
