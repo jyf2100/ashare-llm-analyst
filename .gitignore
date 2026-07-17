@@ -40,6 +40,17 @@ test_reports/
 test_e2e_reports/
 *.log
 
+# ===== back/ 下的数据产物（分析报告 / 训练备份 / numpy 特征标签）=====
+# back/ 只跟踪 .py 源码（8 个），这些 .json/.csv/.txt 是运行产物，不入库。
+# dev-agent 自治提交时跑 `git add -A`——本仓为公开仓，防把数据扫进 PR / 泄到远端。
+back/training_data_backup_*/
+back/*.json
+back/*.csv
+back/test_stocks.txt
+
+# numpy 数组一律是数据产物（特征 / 标签），仓库任意层级忽略
+*.npy
+
 # ===== OS =====
 .DS_Store
 Thumbs.db
